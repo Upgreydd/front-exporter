@@ -1,10 +1,10 @@
 import needle, { NeedleResponse } from 'needle';
+import { Logger } from "./logging";
 
 var colors = require('@colors/colors');
-import { Logger } from "./logging";
 export const log = Logger.getLogger("C");
 
-import 'dotenv/config'
+import 'dotenv/config';
 import * as env from 'env-var';
 export const API_KEY = env.get('API_KEY').required().asString();
 
@@ -16,32 +16,83 @@ export class FrontConnector {
 
     // Aggregates API resources from a resource url and any subsequent _pagination.next urls
     public static async makePaginatedAPIRequest<T>(url: string, resources: T[] = []): Promise<T[]> {
-        let response = await this.makeRateLimitedRequest('get', url);
+        try {
+            let response = await this.makeRateLimitedRequest('get', url);
 
-        // We expect _results to be an array of API resources that match the type specified
-        // Caution: Runtime typecasting
-        for (const item of response.body._results as T[]) {
-            resources.push(item);
-        }
+            // Validate response body
+            if (!response.body || !response.body._results) {
+                log.warn(`Invalid response body from ${url}. Response: ${JSON.stringify(response.body)}`);
+                throw new Error('Invalid response body: missing _results');
+            }
 
-        // If the response has a next URL, call it
-        // This URL will include the query string of the base call
-        if (response.body._pagination?.next) {
-            return await this.makePaginatedAPIRequest(response.body._pagination.next, resources);
-        } else {
-            return resources;
+            // We expect _results to be an array of API resources that match the type specified
+            // Caution: Runtime typecasting
+            for (const item of response.body._results as T[]) {
+                resources.push(item);
+            }
+
+            // If the response has a next URL, call it
+            // This URL will include the query string of the base call
+            if (response.body._pagination?.next) {
+                log.debug(`Fetching next page: ${response.body._pagination.next}`);
+                return await this.makePaginatedAPIRequest(response.body._pagination.next, resources);
+            } else {
+                log.debug(`Completed paginated request. Total resources: ${resources.length}`);
+                return resources;
+            }
+        } catch (error: any) {
+            log.error(`Failed to make paginated API request to ${url}: ${error.message}`);
+            throw error;
         }
     }
 
-    private static async makeRateLimitedRequest(method: string, url: string): Promise<NeedleResponse> {
-        const options = { headers: this.headers };
-        log.debug(`Querying API... ${url}`);
-        let response: NeedleResponse;
-        do {
-            response = await needle('get', url, null, options);
-            await this.handleRateLimiting(response);
-        } while (response.statusCode === 429);
-        return response;
+    private static async makeRateLimitedRequest(method: string, url: string, retryCount = 0): Promise<NeedleResponse> {
+        const maxRetries = 3;
+        const options = {
+            headers: this.headers,
+            read_timeout: 30000,  // 30 second timeout
+            open_timeout: 10000,  // 10 second connection timeout
+            response_timeout: 60000 // 60 second response timeout
+        };
+
+        log.debug(`Querying API... ${url} (attempt ${retryCount + 1})`);
+
+        try {
+            let response: NeedleResponse;
+            do {
+                response = await needle('get', url, null, options);
+                await this.handleRateLimiting(response);
+            } while (response.statusCode === 429);
+
+            // Check for successful response
+            if (response.statusCode && response.statusCode >= 200 && response.statusCode < 300) {
+                return response;
+            } else {
+                throw new Error(`HTTP ${response.statusCode}: ${response.statusMessage}`);
+            }
+        } catch (error: any) {
+            log.warn(`Request failed for ${url}: ${error.message}`);
+
+            // Retry on network errors
+            if (retryCount < maxRetries && this.isRetryableError(error)) {
+                const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff
+                log.warn(`Retrying in ${delay}ms... (${retryCount + 1}/${maxRetries})`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                return this.makeRateLimitedRequest(method, url, retryCount + 1);
+            }
+
+            throw error;
+        }
+    }
+
+    private static isRetryableError(error: any): boolean {
+        // Retry on connection errors, timeouts, and server errors
+        return error.code === 'ECONNRESET' ||
+            error.code === 'ECONNREFUSED' ||
+            error.code === 'ETIMEDOUT' ||
+            error.code === 'ENOTFOUND' ||
+            error.code === 'EAI_AGAIN' ||
+            (error.statusCode && error.statusCode >= 500);
     }
 
     // Please see https://dev.frontapp.com/docs/rate-limiting for additional rate-limiting details

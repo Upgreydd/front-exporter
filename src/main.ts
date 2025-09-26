@@ -1,8 +1,8 @@
-import { ExportOptions } from './types'
 import { FrontExport } from "./export";
+import { Logger } from "./logging";
+import { ExportOptions } from './types';
 
 var colors = require('@colors/colors');
-import { Logger } from "./logging";
 const log = Logger.getLogger("M");
 
 /**
@@ -27,6 +27,11 @@ export function listInboxes() {
                 console.log(colors.yellow(inbox.id), "\t", colors.blue(inbox.name));
                 log.debug(`${inbox.id} \t ${inbox.name}`);
             }
+        })
+        .catch(error => {
+            log.error("Error listing inboxes:", error.message);
+            console.log(colors.red(`Failed to list inboxes: ${error.message}`));
+            process.exit(1);
         });
 }
 
