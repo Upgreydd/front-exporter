@@ -4,11 +4,9 @@
   "description": "Export application for Front Core API",
   "license": "MIT",
   "scripts": {
-    "start": "ts-node ./src/index.ts",
-    "start:optimized": "node --max-old-space-size=4096 --expose-gc --optimize-for-size -r ts-node/register ./src/index.ts",
-    "start:safe": "node --max-old-space-size=8192 --expose-gc -r ts-node/register ./src/index.ts",
-    "rate-limit": "yarn start:optimized rate-limit",
-    "list": "yarn start:optimized list-inboxes"
+    "start": "node --max-old-space-size=4096 --expose-gc --optimize-for-size -r ts-node/register ./src/index.ts",
+    "start:legacy": "ts-node ./src/index.ts",
+    "start:safe": "node --max-old-space-size=8192 --expose-gc -r ts-node/register ./src/index.ts"
   },
   "dependencies": {
     "@colors/colors": "^1.6.0",

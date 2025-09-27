@@ -3,7 +3,7 @@
 export type FrontAPIResponse = {
     _links: ResponseLinks;
     _pagination?: PageLinks;
-    _results: [Resource];
+    _results: Resource[];
 }
 
 export type ResponseLinks = {
@@ -15,7 +15,7 @@ export type ResponseLinks = {
         owner?: string;
         contact?: string;
         inboxes?: string;
-    }   
+    }
 }
 
 export type PageLinks = {
@@ -32,10 +32,10 @@ export interface Inbox extends Resource {
     is_private: boolean;
 }
 
-export type ConversationStatus = 
-    | 'archived' 
-    | 'unassigned' 
-    | 'deleted' 
+export type ConversationStatus =
+    | 'archived'
+    | 'unassigned'
+    | 'deleted'
     | 'assigned';
 
 export interface Conversation extends Resource {
@@ -43,11 +43,11 @@ export interface Conversation extends Resource {
     status: ConversationStatus;
     assignee: Teammate;
     recipient: Recipient;
-    tags: [Tag];
-    links: [TopicLink];
+    tags: Tag[];
+    links: TopicLink[];
     created_at: number;
     is_private: boolean;
-    scheduled_reminders: [Reminder];
+    scheduled_reminders: Reminder[];
     metadata: ConversationMetadata;
 }
 
@@ -61,10 +61,10 @@ export interface Teammate extends Resource {
     is_blocked: boolean;
 }
 
-export type RecipientRole = 
-    | 'from' 
-    | 'to' 
-    | 'cc' 
+export type RecipientRole =
+    | 'from'
+    | 'to'
+    | 'cc'
     | 'bcc';
 
 export interface Recipient extends Resource {
@@ -73,15 +73,15 @@ export interface Recipient extends Resource {
     role: RecipientRole;
 }
 
-export type TagHighlight = 
-    | 'grey' 
-    | 'pink' 
-    | 'red' 
-    | 'orange' 
-    | 'yellow' 
-    | 'green' 
-    | 'light-blue' 
-    | 'blue' 
+export type TagHighlight =
+    | 'grey'
+    | 'pink'
+    | 'red'
+    | 'orange'
+    | 'yellow'
+    | 'green'
+    | 'light-blue'
+    | 'blue'
     | 'purple';
 
 export interface Tag extends Resource {
@@ -107,23 +107,23 @@ export type Reminder = {
 }
 
 export type ConversationMetadata = {
-    external_conversation_ids: [string];
+    external_conversation_ids: string[];
 }
 
-export type MessageType = 
+export type MessageType =
     | 'custom'
-    | 'email' 
-    | 'googleplay' 
+    | 'email'
+    | 'googleplay'
     | 'intercom'
-    | 'internal' 
-    | 'smooch' 
-    | 'phone-call' 
-    | 'call' 
-    | 'sms' 
-    | 'tweet' 
-    | 'tweet_dm' 
-    | 'whatsapp' 
-    | 'yalo_wha' 
+    | 'internal'
+    | 'smooch'
+    | 'phone-call'
+    | 'call'
+    | 'sms'
+    | 'tweet'
+    | 'tweet_dm'
+    | 'whatsapp'
+    | 'yalo_wha'
     | 'front_chat'
 
 export interface Message extends Resource {
@@ -136,10 +136,10 @@ export interface Message extends Resource {
     subject: string;
     blurb: string;
     author?: Teammate;
-    recipients: [Recipient];
+    recipients: Recipient[];
     body: string;
     text: string;
-    attachments: [Attachment];
+    attachments: Attachment[];
     signature: object;
     metadata: object;
 }
@@ -160,7 +160,7 @@ export interface Comment extends Resource {
     author: Teammate;
     body: string;
     posted_at: number;
-    attachments: [Attachment];
+    attachments: Attachment[];
 }
 
 export type ExportOptions = {

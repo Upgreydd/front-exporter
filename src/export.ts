@@ -104,40 +104,46 @@ export class FrontExport {
                     }
                 }
 
-                // Process each conversation in this batch
+                // Process conversations in parallel with intelligent rate limiting
+                const conversationsToProcess = conversations.filter(conv => !processedConversations.has(conv.id));
                 let batchProcessedCount = 0;
 
-                console.log(colors.gray(`🔄 Processing batch ${currentBatch} (${conversations.length} conversations)...`));
+                console.log(colors.gray(`🔄 Processing batch ${currentBatch} (${conversationsToProcess.length} new conversations)...`));
 
-                // Show rate limit warning if getting low
+                // Determine optimal concurrency based on rate limits
                 const currentRateLimit = FrontConnector.getCurrentRateLimit();
+                let concurrency = this._calculateOptimalConcurrency(currentRateLimit);
+
                 if (currentRateLimit && currentRateLimit.remaining < 10) {
                     console.log(colors.yellow(`⚠️  Low API requests: ${currentRateLimit.remaining}/${currentRateLimit.limit} remaining`));
                 }
 
-                for (const conversation of conversations) {
-                    if (!processedConversations.has(conversation.id)) {
-                        await this._processConversation(conversation, inboxPath, options);
-                        await FrontExport.updateProgress(inboxPath, conversation.id);
-                        processedConversations.add(conversation.id);
+                console.log(colors.blue(`⚡ Using ${concurrency} parallel workers for optimal speed`));
+
+                // Process conversations in parallel chunks
+                await this._processConversationsInParallel(
+                    conversationsToProcess,
+                    inboxPath,
+                    options,
+                    concurrency,
+                    (completedConv) => {
+                        // Progress callback for each completed conversation
+                        processedConversations.add(completedConv.id);
                         processedCount++;
                         batchProcessedCount++;
 
                         if (progressBar) {
                             progressBar.increment();
-                        } else {
-                            // Show simple progress without bar
-                            if (batchProcessedCount % 10 === 0 || batchProcessedCount === conversations.length) {
-                                const rateLimitStatus = FrontConnector.getCurrentRateLimit();
-                                const rateLimitText = rateLimitStatus ? ` [${rateLimitStatus.remaining}/${rateLimitStatus.limit} API calls left]` : '';
-                                console.log(`${colors.cyan('▶')} Processed: ${processedCount} conversations${rateLimitText}`);
-                            }
+                        } else if (batchProcessedCount % Math.max(1, Math.floor(conversationsToProcess.length / 10)) === 0) {
+                            const rateLimitStatus = FrontConnector.getCurrentRateLimit();
+                            const rateLimitText = rateLimitStatus ? ` [${rateLimitStatus.remaining}/${rateLimitStatus.limit} API calls left]` : '';
+                            console.log(`${colors.cyan('▶')} Processed: ${processedCount} conversations${rateLimitText}`);
                         }
                     }
-                }
+                );
 
                 if (!progressBar) {
-                    console.log(colors.green(`\n✅ Batch ${currentBatch} completed: ${batchProcessedCount} new conversations processed`));
+                    console.log(colors.green(`\n✅ Batch ${currentBatch} completed: ${batchProcessedCount} conversations processed in parallel`));
                 }
 
                 log.debug(`Processed batch ${currentBatch} of ${conversations.length} conversations. Total processed: ${processedCount}`);
@@ -193,7 +199,7 @@ export class FrontExport {
 
     // ==============================================
     /**
-    * Exports all messages for a conversation.
+    * Exports all messages for a conversation in parallel.
     *
     * @param path - The path where the conversation is located.
     * @param conversation - The conversation from which to export messages.
@@ -201,15 +207,18 @@ export class FrontExport {
     */
     private static async _exportConversationMessages(path: string, conversation: Conversation): Promise<Message[]> {
         const messages = await this._listConversationMessages(conversation);
-        for (const message of messages) {
+
+        // Export messages in parallel (file I/O operations)
+        await Promise.all(messages.map(async (message) => {
             const messagePath = `${path}/${message.created_at}-message-${message.id}.json`;
             exportMessage(messagePath, message);
-        }
+        }));
+
         return messages;
     }
 
     /**
-    * Exports all comments for a conversation.
+    * Exports all comments for a conversation in parallel.
     *
     * @param path - The path where the conversation is located.
     * @param conversation - The conversation from which to export comments.
@@ -217,32 +226,58 @@ export class FrontExport {
     */
     private static async _exportConversationComments(path: string, conversation: Conversation): Promise<Comment[]> {
         const comments = await this._listConversationComments(conversation);
-        for (const comment of comments) {
+
+        // Export comments in parallel (file I/O operations)
+        await Promise.all(comments.map(async (comment) => {
             const commentPath = `${path}/${comment.posted_at}-comment-${comment.id}.json`;
             exportComment(commentPath, comment);
-        }
+        }));
+
         return comments;
     }
 
     /**
-    * Exports all attachments for a message.
+    * Exports all attachments for a message with parallel processing.
     *
     * @param path - The path where the conversation is located.
     * @param message - The message from which to export attachments.
     * @returns A Promise that resolves to an array of Attachment objects.
     */
     private static async _exportMessageAttachments(path: string, message: Message): Promise<Attachment[]> {
-        for (const attachment of message.attachments) {
-            const attachmentPath = `${path}/attachments/${message.id}`;
-            const attachmentBuffer = await FrontConnector.getAttachmentFromURL(attachment.url);
-            log.debug(`Request: ${attachment.url}`);
-            exportAttachment(attachmentPath, attachment, attachmentBuffer);
+        const attachments = message.attachments || [];
+        if (attachments.length === 0) {
+            return attachments;
         }
-        return message.attachments;
+
+        // Process attachments in parallel (limited concurrency to respect rate limits)
+        const concurrency = Math.min(3, attachments.length);
+        const semaphore = new Array(concurrency).fill(null);
+        let currentIndex = 0;
+
+        const processNext = async (): Promise<void> => {
+            while (currentIndex < attachments.length) {
+                const attachment = attachments[currentIndex++];
+                const attachmentPath = `${path}/attachments/${message.id}`;
+
+                try {
+                    log.debug(`Request: ${attachment.url}`);
+                    const attachmentBuffer = await FrontConnector.getAttachmentFromURL(attachment.url);
+                    exportAttachment(attachmentPath, attachment, attachmentBuffer);
+                } catch (error: any) {
+                    log.error(`Failed to export attachment ${attachment.filename}: ${error.message}`);
+                }
+            }
+        };
+
+        // Start parallel workers for attachment export
+        const workers = semaphore.map(() => processNext());
+        await Promise.all(workers);
+
+        return attachments;
     }
 
     /**
-    * Exports all messages for a conversation as .eml files.
+    * Exports all messages for a conversation as .eml files with controlled parallelism.
     *
     * @param path - The path where the conversation is located.
     * @param conversation - The conversation from which to export messages.
@@ -250,13 +285,32 @@ export class FrontExport {
     */
     private static async _exportMessagesAsEML(path: string, conversation: Conversation): Promise<Message[]> {
         const messages = await this._listConversationMessages(conversation);
-        for (const message of messages) {
-            const messagePath = `${path}/${message.created_at}-${message.id}.eml`;
-            const messageUrl = `https://api2.frontapp.com/messages/${message.id}`;
-            log.debug(`Request: ${messageUrl}`);
-            const messageBuffer = await FrontConnector.getMessageFromURL(messageUrl);
-            exportEMLMessage(messagePath, messageBuffer);
-        }
+
+        // Limit concurrency for EML exports to respect rate limits (2 concurrent requests)
+        const concurrency = 2;
+        const semaphore = new Array(concurrency).fill(null);
+        let currentIndex = 0;
+
+        const processNext = async (): Promise<void> => {
+            while (currentIndex < messages.length) {
+                const message = messages[currentIndex++];
+                const messagePath = `${path}/${message.created_at}-${message.id}.eml`;
+                const messageUrl = `https://api2.frontapp.com/messages/${message.id}`;
+
+                try {
+                    log.debug(`Request: ${messageUrl}`);
+                    const messageBuffer = await FrontConnector.getMessageFromURL(messageUrl);
+                    exportEMLMessage(messagePath, messageBuffer);
+                } catch (error: any) {
+                    log.error(`Failed to export EML for message ${message.id}: ${error.message}`);
+                }
+            }
+        };
+
+        // Start parallel workers for EML export
+        const workers = semaphore.map(() => processNext());
+        await Promise.all(workers);
+
         return messages;
     }
 
@@ -345,6 +399,61 @@ export class FrontExport {
         if (options?.includeComments) {
             await this._exportConversationComments(conversationPath, conversation);
         }
+    }
+
+    /**
+    * Calculate optimal concurrency based on current rate limits
+    */
+    private static _calculateOptimalConcurrency(rateLimitInfo: any): number {
+        if (!rateLimitInfo) {
+            return 3; // Conservative default
+        }
+
+        const remainingPercentage = (rateLimitInfo.remaining / rateLimitInfo.limit) * 100;
+
+        // Adaptive concurrency based on available rate limit
+        if (remainingPercentage > 75) {
+            return 8; // High concurrency when plenty of requests available
+        } else if (remainingPercentage > 50) {
+            return 5; // Medium concurrency
+        } else if (remainingPercentage > 25) {
+            return 3; // Conservative concurrency
+        } else {
+            return 1; // Sequential processing when very low on requests
+        }
+    }
+
+    /**
+    * Process conversations in parallel with controlled concurrency
+    */
+    private static async _processConversationsInParallel(
+        conversations: Conversation[],
+        inboxPath: string,
+        options: ExportOptions | undefined,
+        concurrency: number,
+        onProgress: (conversation: Conversation) => void
+    ): Promise<void> {
+        const semaphore = new Array(concurrency).fill(null);
+        let currentIndex = 0;
+
+        const processNext = async (): Promise<void> => {
+            while (currentIndex < conversations.length) {
+                const conversation = conversations[currentIndex++];
+
+                try {
+                    await this._processConversation(conversation, inboxPath, options);
+                    await FrontExport.updateProgress(inboxPath, conversation.id);
+                    onProgress(conversation);
+                } catch (error: any) {
+                    log.error(`Error processing conversation ${conversation.id}: ${error.message}`);
+                    // Continue with other conversations even if one fails
+                }
+            }
+        };
+
+        // Start parallel workers
+        const workers = semaphore.map(() => processNext());
+        await Promise.all(workers);
     }
 
     /**
