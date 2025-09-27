@@ -75,10 +75,18 @@ export class FrontExport {
             console.log(colors.blue(`🔄 Resuming from ${processedConversations.size} already processed conversations`));
         }
 
-        // Show rate limit information at start
+        // Show rate limit information at start including burst capacity
         const initialRateLimit = FrontConnector.getCurrentRateLimit();
         if (initialRateLimit) {
-            console.log(colors.cyan(`📊 API Rate Limit: ${initialRateLimit.remaining}/${initialRateLimit.limit} requests available`));
+            const regularRemaining = initialRateLimit.remaining || 0;
+            const burstRemaining = initialRateLimit.burstRemaining ?? 0;
+            const totalAvailable = regularRemaining + burstRemaining;
+
+            if (burstRemaining > 0) {
+                console.log(colors.cyan(`📊 API Rate Limit: ${regularRemaining}/${initialRateLimit.limit} regular + ${burstRemaining}/${initialRateLimit.burstLimit || 0} burst = ${totalAvailable} total available`));
+            } else {
+                console.log(colors.cyan(`📊 API Rate Limit: ${regularRemaining}/${initialRateLimit.limit} requests available`));
+            }
         } await FrontConnector.processPaginatedAPIRequest<Conversation>(
             inboxConversationsUrl,
             async (conversations: Conversation[], isLastBatch: boolean) => {
@@ -123,8 +131,18 @@ export class FrontExport {
                 const currentRateLimit = FrontConnector.getCurrentRateLimit();
                 let concurrency = this._calculateOptimalConcurrency(currentRateLimit);
 
-                if (currentRateLimit && currentRateLimit.remaining < 10) {
-                    console.log(colors.yellow(`⚠️  Low API requests: ${currentRateLimit.remaining}/${currentRateLimit.limit} remaining`));
+                if (currentRateLimit) {
+                    const regularRemaining = currentRateLimit.remaining || 0;
+                    const burstRemaining = currentRateLimit.burstRemaining ?? 0;
+                    const totalAvailable = regularRemaining + burstRemaining;
+
+                    if (totalAvailable < 15) { // Warn when total available is low
+                        if (burstRemaining > 0) {
+                            console.log(colors.yellow(`⚠️  Low total API capacity: ${regularRemaining}/${currentRateLimit.limit} regular + ${burstRemaining}/${currentRateLimit.burstLimit || 0} burst = ${totalAvailable} remaining`));
+                        } else {
+                            console.log(colors.yellow(`⚠️  Low API requests: ${regularRemaining}/${currentRateLimit.limit} remaining`));
+                        }
+                    }
                 }
 
                 console.log(colors.blue(`⚡ Using ${concurrency} parallel workers for optimal speed`));
@@ -438,17 +456,32 @@ export class FrontExport {
             return 3; // Conservative default
         }
 
-        const remainingPercentage = (rateLimitInfo.remaining / rateLimitInfo.limit) * 100;
+        // Calculate total available requests including burst capacity
+        const regularRemaining = rateLimitInfo.remaining || 0;
+        const burstRemaining = rateLimitInfo.burstRemaining ?? 0;
+        const totalAvailable = regularRemaining + burstRemaining;
 
-        // Adaptive concurrency based on available rate limit
-        if (remainingPercentage > 75) {
-            return 8; // High concurrency when plenty of requests available
-        } else if (remainingPercentage > 50) {
-            return 5; // Medium concurrency
-        } else if (remainingPercentage > 25) {
-            return 3; // Conservative concurrency
+        // Calculate total capacity including burst
+        const regularLimit = rateLimitInfo.limit || 50;
+        const burstLimit = rateLimitInfo.burstLimit ?? 0;
+        const totalCapacity = regularLimit + burstLimit;
+
+        // Calculate percentage based on TOTAL available requests (regular + burst)
+        const totalAvailablePercentage = totalCapacity > 0 ? (totalAvailable / totalCapacity) * 100 : 0;
+
+        log.debug(`Rate limit calculation: Regular ${regularRemaining}/${regularLimit}, Burst ${burstRemaining}/${burstLimit}, Total ${totalAvailable}/${totalCapacity} (${totalAvailablePercentage.toFixed(1)}%)`);
+
+        // Adaptive concurrency based on TOTAL available capacity (including burst)
+        if (totalAvailablePercentage > 75) {
+            return 8; // High concurrency when plenty of total requests available
+        } else if (totalAvailablePercentage > 50) {
+            return 6; // Medium-high concurrency
+        } else if (totalAvailablePercentage > 25) {
+            return 4; // Medium concurrency
+        } else if (totalAvailablePercentage > 10) {
+            return 2; // Conservative concurrency
         } else {
-            return 1; // Sequential processing when very low on requests
+            return 1; // Sequential processing when very low on total requests
         }
     }
 

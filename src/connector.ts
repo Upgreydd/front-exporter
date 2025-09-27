@@ -202,11 +202,17 @@ export class FrontConnector {
         if (!this.isShowingCountdown) {
             this.isShowingCountdown = true;
 
-            // Single clear message about rate limit
-            if (rateLimitInfo.remaining && rateLimitInfo.remaining > 0) {
-                console.log(colors.red.bold(`⚠️  Burst rate limit exceeded (Tier ${rateLimitInfo.frontTier || '?'}). Waiting ${waitTimeSeconds}s...`));
+            // Single clear message about rate limit with burst information
+            const regularRemaining = rateLimitInfo.remaining || 0;
+            const burstRemaining = rateLimitInfo.burstRemaining ?? 0;
+            const totalAvailable = regularRemaining + burstRemaining;
+
+            if (regularRemaining > 0 && burstRemaining === 0) {
+                console.log(colors.red.bold(`⚠️  Burst rate limit exceeded (Tier ${rateLimitInfo.frontTier || '?'}). Regular: ${regularRemaining}/${rateLimitInfo.limit}. Waiting ${waitTimeSeconds}s...`));
+            } else if (totalAvailable === 0) {
+                console.log(colors.red.bold(`🚫 All rate limits exceeded (Regular: ${regularRemaining}/${rateLimitInfo.limit}, Burst: ${burstRemaining}/${rateLimitInfo.burstLimit || 0}). Waiting ${waitTimeSeconds}s...`));
             } else {
-                console.log(colors.red.bold(`🚫 Rate limit exceeded (${rateLimitInfo.remaining}/${rateLimitInfo.limit}). Waiting ${waitTimeSeconds}s...`));
+                console.log(colors.red.bold(`🚫 Rate limit exceeded (${regularRemaining}/${rateLimitInfo.limit}). Waiting ${waitTimeSeconds}s...`));
             }
 
             // Log once for debugging
@@ -224,26 +230,44 @@ export class FrontConnector {
 
     // Proactive management to avoid hitting rate limits
     private static async proactiveRateLimitManagement(rateLimitInfo: RateLimitInfo): Promise<void> {
-        const remainingPercentage = (rateLimitInfo.remaining / rateLimitInfo.limit) * 100;
+        // Calculate total available requests including burst capacity
+        const regularRemaining = rateLimitInfo.remaining || 0;
+        const burstRemaining = rateLimitInfo.burstRemaining ?? 0;
+        const totalAvailable = regularRemaining + burstRemaining;
+
+        const regularLimit = rateLimitInfo.limit || 50;
+        const burstLimit = rateLimitInfo.burstLimit ?? 0;
+        const totalCapacity = regularLimit + burstLimit;
+
+        const totalAvailablePercentage = totalCapacity > 0 ? (totalAvailable / totalCapacity) * 100 : 0;
         const timeUntilReset = rateLimitInfo.reset ? (rateLimitInfo.reset * 1000) - Date.now() : 60000;
         const secondsUntilReset = Math.max(0, Math.floor(timeUntilReset / 1000));
 
-        // Only show message when critically low (< 5%)
-        if (remainingPercentage < 5 && rateLimitInfo.remaining > 0) {
+        // Only show message when critically low on TOTAL available requests (< 5%)
+        if (totalAvailablePercentage < 5 && totalAvailable > 0) {
             const delayMs = Math.max(500, (60 - secondsUntilReset) * 50);
 
             // Only log this warning once per 2 minutes to avoid spam
             const now = Date.now();
             if ((now - this.lastRateLimitWarning) > 120000) {
-                console.log(colors.yellow(`⚠️  Critical API quota: ${rateLimitInfo.remaining}/${rateLimitInfo.limit}. Slowing down...`));
+                if (burstRemaining > 0) {
+                    console.log(colors.yellow(`⚠️  Critical total quota: ${totalAvailable}/${totalCapacity} (${regularRemaining} regular + ${burstRemaining} burst). Slowing down...`));
+                } else {
+                    console.log(colors.yellow(`⚠️  Critical API quota: ${regularRemaining}/${regularLimit}. Slowing down...`));
+                }
                 this.lastRateLimitWarning = now;
             }
 
             await new Promise(resolve => setTimeout(resolve, delayMs));
-        } else if (remainingPercentage < 15 && rateLimitInfo.remaining > 0) {
-            // Silent adaptive delay for low requests
+        } else if (totalAvailablePercentage < 15 && totalAvailable > 0) {
+            // Silent adaptive delay for low total requests
             const delayMs = Math.max(100, (60 - secondsUntilReset) * 10);
             await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+
+        // Log burst usage when we're using burst capacity
+        if (regularRemaining === 0 && burstRemaining > 0) {
+            log.debug(`Using burst capacity: ${burstRemaining}/${burstLimit} burst requests remaining`);
         }
     }    // Only log rate limit status when specifically requested (removed frequent logging)
     private static logRateLimitStatus(rateLimitInfo: RateLimitInfo): void {
@@ -273,15 +297,33 @@ export class FrontConnector {
         return this.currentRateLimit;
     }
 
-    // Get a summary of rate limit usage
+    // Get a summary of rate limit usage including burst capacity
     public static getRateLimitSummary(): string {
         if (!this.currentRateLimit) {
             return 'No rate limit information available';
         }
 
         const rl = this.currentRateLimit;
-        const percentage = ((rl.limit - rl.remaining) / rl.limit * 100).toFixed(1);
-        return `Used ${rl.limit - rl.remaining}/${rl.limit} requests (${percentage}%). ${rl.remaining} remaining.`;
+        const regularUsed = rl.limit - rl.remaining;
+        const regularPercentage = ((regularUsed) / rl.limit * 100).toFixed(1);
+
+        let summary = `Used ${regularUsed}/${rl.limit} requests (${regularPercentage}%). ${rl.remaining} remaining.`;
+
+        // Add burst information if available
+        if (rl.burstLimit && rl.burstRemaining !== undefined) {
+            const burstUsed = rl.burstLimit - rl.burstRemaining;
+            const burstPercentage = ((burstUsed) / rl.burstLimit * 100).toFixed(1);
+            summary += ` Burst: ${burstUsed}/${rl.burstLimit} used (${burstPercentage}%), ${rl.burstRemaining} remaining.`;
+
+            // Total capacity summary
+            const totalUsed = regularUsed + burstUsed;
+            const totalCapacity = rl.limit + rl.burstLimit;
+            const totalAvailable = rl.remaining + rl.burstRemaining;
+            const totalPercentage = ((totalUsed) / totalCapacity * 100).toFixed(1);
+            summary += ` Total capacity: ${totalUsed}/${totalCapacity} used (${totalPercentage}%), ${totalAvailable} available.`;
+        }
+
+        return summary;
     }
 
     private static parseHeaderInt(res: NeedleResponse, key: string): number | undefined {
