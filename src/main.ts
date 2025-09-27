@@ -21,6 +21,10 @@ const options: ExportOptions = {
 // List all inboxes available to the API key
 export function listInboxes() {
     log.info(`Listing Inboxes...`);
+
+    // Reset progress tracking for this session
+    FrontConnector.resetProgressTracking();
+
     FrontExport.listInboxes()
         .then(inboxes => {
             console.log(colors.yellow.underline("ID"), "\t\t", colors.blue.underline("Name"));
@@ -40,6 +44,9 @@ export function listInboxes() {
 export async function exportAll(shouldResume: any) {
     // Warning: May take a very long time to complete!
     try {
+        // Reset progress tracking for this export session
+        FrontConnector.resetProgressTracking();
+
         const inboxes = await FrontExport.listInboxes();
 
         console.log(colors.magenta.bold(`\n📦 Starting export for ${inboxes.length} inboxes`));
@@ -91,6 +98,9 @@ export async function exportAll(shouldResume: any) {
 // Export all conversations from a specific inbox, for example, an inbox with ID 'inb_abc'
 export async function exportFromInbox(inboxID: string, shouldResume: any) {
     try {
+        // Reset progress tracking for this export session
+        FrontConnector.resetProgressTracking();
+
         const inboxes = await FrontExport.listInboxes();
         const inboxToExport = inboxes.find(inbox => inbox.id === inboxID);
 

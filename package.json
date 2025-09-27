@@ -23,7 +23,7 @@
   },
   "devDependencies": {
     "@types/fs-extra": "^11.0.4",
-    "@types/node": "^20.12.11",
+    "@types/node": "^24.5.2",
     "@types/yargs": "^17.0.32"
   }
 }

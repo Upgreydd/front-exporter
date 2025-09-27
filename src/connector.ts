@@ -29,6 +29,12 @@ export class FrontConnector {
     private static currentRateLimit: RateLimitInfo | null = null;
     private static lastRateLimitWarning = 0;
     private static requestCount = 0;
+    private static isShowingCountdown = false;  // Prevent multiple parallel countdowns
+
+    // Progress tracking for enhanced logging
+    private static sessionStartTime: number = Date.now();
+    private static lastProgressReport: number = 0;
+    private static totalProcessedItems: number = 0;
 
     // Aggregates API resources from a resource url and any subsequent _pagination.next urls
     public static async makePaginatedAPIRequest<T>(url: string, resources: T[] = []): Promise<T[]> {
@@ -53,7 +59,7 @@ export class FrontConnector {
                 log.debug(`Fetching next page: ${response.body._pagination.next}`);
                 return await this.makePaginatedAPIRequest(response.body._pagination.next, resources);
             } else {
-                log.debug(`Completed paginated request. Total resources: ${resources.length}`);
+                this._logPaginatedProgress(resources.length, 'completed');
                 return resources;
             }
         } catch (error: any) {
@@ -96,7 +102,7 @@ export class FrontConnector {
                 await new Promise(resolve => setTimeout(resolve, 10));
             }
 
-            log.debug(`Completed paginated processing. Total processed: ${totalProcessed}`);
+            this._logPaginatedProgress(totalProcessed, 'processing completed');
         } catch (error: any) {
             log.error(`Failed to process paginated API request to ${url}: ${error.message}`);
             throw error;
@@ -112,7 +118,7 @@ export class FrontConnector {
             response_timeout: 60000 // 60 second response timeout
         };
 
-        log.debug(`Querying API... ${url} (attempt ${retryCount + 1})`);
+        this._logProgressStatistics(url, retryCount + 1);
 
         try {
             let response: NeedleResponse;
@@ -184,8 +190,7 @@ export class FrontConnector {
             return;
         }
 
-        // Log status and proactive management only for successful requests
-        this.logRateLimitStatus(rateLimitInfo);
+        // Only do proactive management for successful requests
         await this.proactiveRateLimitManagement(rateLimitInfo);
     }
 
@@ -193,18 +198,28 @@ export class FrontConnector {
     private static async handleRateLimitExceeded(rateLimitInfo: RateLimitInfo): Promise<void> {
         const waitTimeSeconds = rateLimitInfo.retryAfter || 60;
 
-        // Single clear message about rate limit
-        if (rateLimitInfo.remaining && rateLimitInfo.remaining > 0) {
-            console.log(colors.red.bold(`⚠️  Burst rate limit exceeded (Tier ${rateLimitInfo.frontTier || '?'}). Waiting ${waitTimeSeconds}s...`));
+        // Only first worker shows the countdown to avoid spam
+        if (!this.isShowingCountdown) {
+            this.isShowingCountdown = true;
+
+            // Single clear message about rate limit
+            if (rateLimitInfo.remaining && rateLimitInfo.remaining > 0) {
+                console.log(colors.red.bold(`⚠️  Burst rate limit exceeded (Tier ${rateLimitInfo.frontTier || '?'}). Waiting ${waitTimeSeconds}s...`));
+            } else {
+                console.log(colors.red.bold(`🚫 Rate limit exceeded (${rateLimitInfo.remaining}/${rateLimitInfo.limit}). Waiting ${waitTimeSeconds}s...`));
+            }
+
+            // Log once for debugging
+            log.debug(`Rate limit exceeded. Waiting ${waitTimeSeconds} seconds.`);
+
+            // Single countdown without overlapping messages
+            await this.showCountdown(waitTimeSeconds);
+
+            this.isShowingCountdown = false;
         } else {
-            console.log(colors.red.bold(`🚫 Rate limit exceeded (${rateLimitInfo.remaining}/${rateLimitInfo.limit}). Waiting ${waitTimeSeconds}s...`));
+            // Other workers just wait silently
+            await new Promise(resolve => setTimeout(resolve, waitTimeSeconds * 1000));
         }
-
-        // Log once for debugging
-        log.debug(`Rate limit exceeded. Waiting ${waitTimeSeconds} seconds.`);
-
-        // Single countdown without overlapping messages
-        await this.showCountdown(waitTimeSeconds);
     }
 
     // Proactive management to avoid hitting rate limits
@@ -213,39 +228,27 @@ export class FrontConnector {
         const timeUntilReset = rateLimitInfo.reset ? (rateLimitInfo.reset * 1000) - Date.now() : 60000;
         const secondsUntilReset = Math.max(0, Math.floor(timeUntilReset / 1000));
 
-        // Only show message once when getting very low
-        if (remainingPercentage < 10 && rateLimitInfo.remaining > 0) {
+        // Only show message when critically low (< 5%)
+        if (remainingPercentage < 5 && rateLimitInfo.remaining > 0) {
             const delayMs = Math.max(500, (60 - secondsUntilReset) * 50);
 
-            // Only log this warning once per minute to avoid spam
+            // Only log this warning once per 2 minutes to avoid spam
             const now = Date.now();
-            if ((now - this.lastRateLimitWarning) > 60000) {
-                console.log(colors.yellow(`⚠️  Low API quota: ${rateLimitInfo.remaining}/${rateLimitInfo.limit}. Slowing down...`));
+            if ((now - this.lastRateLimitWarning) > 120000) {
+                console.log(colors.yellow(`⚠️  Critical API quota: ${rateLimitInfo.remaining}/${rateLimitInfo.limit}. Slowing down...`));
                 this.lastRateLimitWarning = now;
             }
 
             await new Promise(resolve => setTimeout(resolve, delayMs));
-        } else if (remainingPercentage < 20 && rateLimitInfo.remaining > 0) {
-            // Silent adaptive delay for medium-low requests
+        } else if (remainingPercentage < 15 && rateLimitInfo.remaining > 0) {
+            // Silent adaptive delay for low requests
             const delayMs = Math.max(100, (60 - secondsUntilReset) * 10);
             await new Promise(resolve => setTimeout(resolve, delayMs));
         }
-    }    // Log rate limit status with intelligent frequency
+    }    // Only log rate limit status when specifically requested (removed frequent logging)
     private static logRateLimitStatus(rateLimitInfo: RateLimitInfo): void {
-        const now = Date.now();
         const remainingPercentage = (rateLimitInfo.remaining / rateLimitInfo.limit) * 100;
-
-        // Much more conservative logging: only when very low or every 2 minutes
-        const shouldLog = remainingPercentage < 15 ||
-            (now - this.lastRateLimitWarning) > 120000; // 2 minutes
-
-        if (shouldLog) {
-            const statusColor = remainingPercentage > 25 ? colors.yellow : colors.red;
-            console.log(statusColor(`📊 Rate Limit: ${rateLimitInfo.remaining}/${rateLimitInfo.limit} remaining (${remainingPercentage.toFixed(0)}%)`));
-
-            log.debug(`Rate limit status: ${rateLimitInfo.remaining}/${rateLimitInfo.limit} (${remainingPercentage.toFixed(1)}%)`);
-            this.lastRateLimitWarning = now;
-        }
+        log.debug(`Rate limit status: ${rateLimitInfo.remaining}/${rateLimitInfo.limit} (${remainingPercentage.toFixed(1)}%)`);
     }    // Show countdown for long waits
     private static async showCountdown(seconds: number): Promise<void> {
         // Clear any existing line first
@@ -298,5 +301,77 @@ export class FrontConnector {
     public static async getMessageFromURL(url: string): Promise<Buffer> {
         let response = await this.makeRateLimitedRequest('get', url);
         return response.body;
+    }
+
+    // Progress tracking methods for enhanced logging
+    private static _logProgressStatistics(url: string, attempt: number): void {
+        const now = Date.now();
+        const sessionDuration = now - this.sessionStartTime;
+        const sessionMinutes = sessionDuration / 60000;
+        const requestsPerMinute = sessionMinutes > 0 ? (this.requestCount / sessionMinutes).toFixed(1) : '0';
+
+        // Extract endpoint type for better context
+        const endpointType = this._getEndpointType(url);
+
+        log.debug(`API Request [${this.requestCount}] - ${endpointType} (attempt ${attempt}) | RPM: ${requestsPerMinute} | Session: ${this._formatDuration(sessionDuration)}`);
+
+        // Periodic progress report (every 2 minutes)
+        if ((now - this.lastProgressReport) > 120000) {
+            this._logPeriodicProgress();
+            this.lastProgressReport = now;
+        }
+    }
+
+    private static _logPaginatedProgress(totalItems: number, operation: string): void {
+        this.totalProcessedItems += totalItems;
+        const sessionDuration = Date.now() - this.sessionStartTime;
+        const itemsPerMinute = sessionDuration > 0 ? ((this.totalProcessedItems / sessionDuration) * 60000).toFixed(1) : '0';
+
+        log.debug(`Paginated ${operation}: ${totalItems} items | Total processed: ${this.totalProcessedItems} | Rate: ${itemsPerMinute} items/min`);
+    }
+
+    private static _logPeriodicProgress(): void {
+        const sessionDuration = Date.now() - this.sessionStartTime;
+        const sessionMinutes = sessionDuration / 60000;
+        const requestsPerMinute = sessionMinutes > 0 ? (this.requestCount / sessionMinutes).toFixed(1) : '0';
+        const itemsPerMinute = sessionDuration > 0 ? ((this.totalProcessedItems / sessionDuration) * 60000).toFixed(1) : '0';
+
+        const rateLimitStatus = this.currentRateLimit ?
+            `${this.currentRateLimit.remaining}/${this.currentRateLimit.limit} (${((this.currentRateLimit.remaining / this.currentRateLimit.limit) * 100).toFixed(0)}%)` :
+            'Unknown';
+
+        log.info(`📊 Session Progress: ${this.requestCount} API calls | ${this.totalProcessedItems} items processed | ${requestsPerMinute} req/min | ${itemsPerMinute} items/min | Rate limit: ${rateLimitStatus} | Uptime: ${this._formatDuration(sessionDuration)}`);
+    }
+
+    private static _getEndpointType(url: string): string {
+        if (url.includes('/conversations')) return 'Conversations';
+        if (url.includes('/messages')) return 'Messages';
+        if (url.includes('/comments')) return 'Comments';
+        if (url.includes('/inboxes')) return 'Inboxes';
+        if (url.includes('/attachments')) return 'Attachments';
+        return 'API';
+    }
+
+    private static _formatDuration(ms: number): string {
+        const seconds = Math.floor(ms / 1000);
+        const minutes = Math.floor(seconds / 60);
+        const hours = Math.floor(minutes / 60);
+
+        if (hours > 0) {
+            return `${hours}h ${minutes % 60}m`;
+        } else if (minutes > 0) {
+            return `${minutes}m ${seconds % 60}s`;
+        } else {
+            return `${seconds}s`;
+        }
+    }
+
+    // Public method to reset progress tracking for new export sessions
+    public static resetProgressTracking(): void {
+        this.sessionStartTime = Date.now();
+        this.requestCount = 0;
+        this.totalProcessedItems = 0;
+        this.lastProgressReport = 0;
+        log.info('📊 Progress tracking reset for new export session');
     }
 }

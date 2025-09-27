@@ -160,13 +160,15 @@ export class FrontExport {
         console.log(colors.cyan(`📈 Total conversations processed: ${processedCount}`));
         if (totalConversations > 0) {
             console.log(colors.cyan(`📊 Total conversations in inbox: ${totalConversations}`));
+            const completionPercentage = ((processedCount / totalConversations) * 100).toFixed(1);
+            console.log(colors.cyan(`📊 Completion rate: ${completionPercentage}%`));
         }
 
-        // Show final rate limit status
+        // Show final rate limit status and session statistics
         const rateLimitSummary = FrontConnector.getRateLimitSummary();
         console.log(colors.gray(`📊 API Usage: ${rateLimitSummary}`));
 
-        log.info(`Export completed. Total conversations processed: ${processedCount}`);
+        log.info(`Export completed. Total conversations processed: ${processedCount}. ${totalConversations > 0 ? `Completion: ${((processedCount / totalConversations) * 100).toFixed(1)}%` : ''}`);
         return processedCount;
     }
 
