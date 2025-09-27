@@ -51,11 +51,20 @@ export class FrontExport {
         let totalBatches = 0;
         let currentBatch = 0;
 
-        // If we have a cached conversation list, use it to get total count
+        // If we have a cached conversation list, validate and use it to get total count
         if (fs.existsSync(outputFilePath)) {
-            console.log(colors.green(`Using existing conversation list: ${outputFilePath}`));
-            const cachedData = JSON.parse(fs.readFileSync(outputFilePath, 'utf8'));
-            totalConversations = cachedData.length;
+            if (this.isValidJsonFile(outputFilePath)) {
+                console.log(colors.green(`Using existing conversation list: ${outputFilePath}`));
+                const cachedData = JSON.parse(fs.readFileSync(outputFilePath, 'utf8'));
+                totalConversations = cachedData.length;
+            } else {
+                console.log(colors.yellow(`⚠️  Cached conversation list is corrupted or incomplete`));
+                console.log(colors.yellow(`🔄 Rebuilding conversation list from API...`));
+
+                // Remove corrupted cache file to force rebuild
+                fs.unlinkSync(outputFilePath);
+                log.warn(`Removed corrupted cache file: ${outputFilePath}. Will rebuild from API.`);
+            }
         }
 
         const inboxConversationsUrl = `https://api2.frontapp.com/inboxes/${inbox.id}/conversations`;
@@ -346,24 +355,42 @@ export class FrontExport {
         conversations: Conversation[],
         isLastBatch: boolean
     ): Promise<void> {
-        const isFirstWrite = !fs.existsSync(outputFilePath);
+        try {
+            const isFirstWrite = !fs.existsSync(outputFilePath);
 
-        if (isFirstWrite) {
-            // Write opening bracket
-            await fs.writeFile(outputFilePath, '[\n');
-        }
+            if (isFirstWrite) {
+                // Write opening bracket
+                await fs.writeFile(outputFilePath, '[\n');
+                log.debug(`Started new cache file: ${outputFilePath}`);
+            }
 
-        for (let i = 0; i < conversations.length; i++) {
-            const conversation = conversations[i];
-            const jsonLine = JSON.stringify(conversation, null, 2);
-            const separator = (!isFirstWrite || i > 0) ? ',\n' : '';
-            await fs.appendFile(outputFilePath, separator + jsonLine);
-        }
+            for (let i = 0; i < conversations.length; i++) {
+                const conversation = conversations[i];
+                const jsonLine = JSON.stringify(conversation, null, 2);
+                const separator = (!isFirstWrite || i > 0) ? ',\n' : '';
+                await fs.appendFile(outputFilePath, separator + jsonLine);
+            }
 
-        if (isLastBatch) {
-            // Write closing bracket
-            await fs.appendFile(outputFilePath, '\n]');
-            console.log(colors.green(`Conversations have been saved to: ${outputFilePath}`));
+            if (isLastBatch) {
+                // Write closing bracket
+                await fs.appendFile(outputFilePath, '\n]');
+                console.log(colors.green(`✅ Conversations cached: ${outputFilePath}`));
+                log.info(`Completed conversation cache file: ${outputFilePath}`);
+            } else {
+                log.debug(`Appended ${conversations.length} conversations to cache (batch continuing...)`);
+            }
+        } catch (error: any) {
+            log.error(`Failed to write to cache file ${outputFilePath}: ${error.message}`);
+            // If writing fails, remove the partial file to avoid corruption
+            if (fs.existsSync(outputFilePath)) {
+                try {
+                    fs.unlinkSync(outputFilePath);
+                    log.warn(`Removed partial cache file due to write error: ${outputFilePath}`);
+                } catch (unlinkError: any) {
+                    log.error(`Could not remove partial cache file: ${unlinkError.message}`);
+                }
+            }
+            throw error;
         }
     }
 
@@ -465,6 +492,41 @@ export class FrontExport {
     */
     private static async updateProgress(path: string, conversationId: any): Promise<void> {
         await fs.outputFile(`${path}/progress.log`, `${conversationId}\n`, { flag: 'a' });
+    }
+
+    /**
+    * Validates if a JSON file is properly formed and complete
+    * @param filePath - Path to the JSON file to validate
+    * @returns true if valid, false if corrupted
+    */
+    private static isValidJsonFile(filePath: string): boolean {
+        try {
+            if (!fs.existsSync(filePath)) {
+                return false;
+            }
+
+            const content = fs.readFileSync(filePath, 'utf8').trim();
+
+            // Check if it starts with '[' and ends with ']'
+            if (!content.startsWith('[') || !content.endsWith(']')) {
+                log.warn(`JSON file ${filePath} has invalid structure (missing brackets)`);
+                return false;
+            }
+
+            // Try to parse it
+            const parsed = JSON.parse(content);
+
+            // Verify it's an array
+            if (!Array.isArray(parsed)) {
+                log.warn(`JSON file ${filePath} does not contain an array`);
+                return false;
+            }
+
+            return true;
+        } catch (error: any) {
+            log.warn(`JSON file ${filePath} validation failed: ${error.message}`);
+            return false;
+        }
     }
 
 }
