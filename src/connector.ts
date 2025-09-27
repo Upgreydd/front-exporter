@@ -116,10 +116,18 @@ export class FrontConnector {
 
         try {
             let response: NeedleResponse;
-            do {
+
+            // Make the request and handle rate limiting once per request
+            response = await needle('get', url, null, options);
+            await this.handleRateLimiting(response);
+
+            // If we got rate limited, the handleRateLimiting already waited,
+            // so we don't need a do-while loop
+            if (response.statusCode === 429) {
+                // After waiting, make one more attempt
                 response = await needle('get', url, null, options);
                 await this.handleRateLimiting(response);
-            } while (response.statusCode === 429);
+            }
 
             // Check for successful response
             if (response.statusCode && response.statusCode >= 200 && response.statusCode < 300) {
@@ -170,48 +178,33 @@ export class FrontConnector {
         this.currentRateLimit = rateLimitInfo;
         this.requestCount++;
 
-        // Log detailed rate limit status periodically or when approaching limits
-        this.logRateLimitStatus(rateLimitInfo);
-
-        // Handle 429 Too Many Requests
+        // Handle 429 Too Many Requests FIRST to avoid multiple processing
         if (res.statusCode === 429) {
             await this.handleRateLimitExceeded(rateLimitInfo);
             return;
         }
 
-        // Proactive rate limit management - slow down when approaching limits
+        // Log status and proactive management only for successful requests
+        this.logRateLimitStatus(rateLimitInfo);
         await this.proactiveRateLimitManagement(rateLimitInfo);
     }
 
     // Handle when rate limit is exceeded (429 response)
     private static async handleRateLimitExceeded(rateLimitInfo: RateLimitInfo): Promise<void> {
         const waitTimeSeconds = rateLimitInfo.retryAfter || 60;
-        const waitTimeMs = waitTimeSeconds * 1000;
 
+        // Single clear message about rate limit
         if (rateLimitInfo.remaining && rateLimitInfo.remaining > 0) {
-            // Burst limit exceeded
-            console.log(colors.red.bold('⚠️  BURST RATE LIMIT EXCEEDED'));
-            console.log(colors.yellow(`   Tier: ${rateLimitInfo.frontTier || 'Unknown'}`));
-            console.log(colors.yellow(`   Regular requests remaining: ${rateLimitInfo.remaining}/${rateLimitInfo.limit}`));
-            if (rateLimitInfo.burstRemaining !== undefined) {
-                console.log(colors.yellow(`   Burst requests remaining: ${rateLimitInfo.burstRemaining}/${rateLimitInfo.burstLimit || 'Unknown'}`));
-            }
+            console.log(colors.red.bold(`⚠️  Burst rate limit exceeded (Tier ${rateLimitInfo.frontTier || '?'}). Waiting ${waitTimeSeconds}s...`));
         } else {
-            // Global rate limit exceeded
-            console.log(colors.red.bold('🚫 GLOBAL RATE LIMIT EXCEEDED'));
-            console.log(colors.yellow(`   Rate limit: ${rateLimitInfo.limit} requests/minute`));
-            console.log(colors.yellow(`   Requests remaining: ${rateLimitInfo.remaining}`));
+            console.log(colors.red.bold(`🚫 Rate limit exceeded (${rateLimitInfo.remaining}/${rateLimitInfo.limit}). Waiting ${waitTimeSeconds}s...`));
         }
 
-        console.log(colors.cyan(`⏳ Waiting ${waitTimeSeconds} seconds before retry...`));
-        log.warn(`Rate limit exceeded. Waiting ${waitTimeSeconds} seconds.`);
+        // Log once for debugging
+        log.debug(`Rate limit exceeded. Waiting ${waitTimeSeconds} seconds.`);
 
-        // Show countdown for long waits
-        if (waitTimeSeconds > 10) {
-            await this.showCountdown(waitTimeSeconds);
-        } else {
-            await new Promise(resolve => setTimeout(resolve, waitTimeMs));
-        }
+        // Single countdown without overlapping messages
+        await this.showCountdown(waitTimeSeconds);
     }
 
     // Proactive management to avoid hitting rate limits
@@ -220,70 +213,59 @@ export class FrontConnector {
         const timeUntilReset = rateLimitInfo.reset ? (rateLimitInfo.reset * 1000) - Date.now() : 60000;
         const secondsUntilReset = Math.max(0, Math.floor(timeUntilReset / 1000));
 
-        // If we're getting low on requests, slow down
-        if (remainingPercentage < 20 && rateLimitInfo.remaining > 0) {
-            const delayMs = Math.max(100, (60 - secondsUntilReset) * 10); // Adaptive delay
-
-            log.debug(`Proactive rate limiting: ${rateLimitInfo.remaining} requests remaining (${remainingPercentage.toFixed(1)}%). Delaying ${delayMs}ms`);
-            await new Promise(resolve => setTimeout(resolve, delayMs));
-        }
-
-        // If we're very low on requests, add more significant delay
+        // Only show message once when getting very low
         if (remainingPercentage < 10 && rateLimitInfo.remaining > 0) {
             const delayMs = Math.max(500, (60 - secondsUntilReset) * 50);
 
-            console.log(colors.yellow(`⚠️  Low on API requests: ${rateLimitInfo.remaining}/${rateLimitInfo.limit} remaining. Slowing down...`));
+            // Only log this warning once per minute to avoid spam
+            const now = Date.now();
+            if ((now - this.lastRateLimitWarning) > 60000) {
+                console.log(colors.yellow(`⚠️  Low API quota: ${rateLimitInfo.remaining}/${rateLimitInfo.limit}. Slowing down...`));
+                this.lastRateLimitWarning = now;
+            }
+
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+        } else if (remainingPercentage < 20 && rateLimitInfo.remaining > 0) {
+            // Silent adaptive delay for medium-low requests
+            const delayMs = Math.max(100, (60 - secondsUntilReset) * 10);
             await new Promise(resolve => setTimeout(resolve, delayMs));
         }
-    }
-
-    // Log rate limit status with intelligent frequency
+    }    // Log rate limit status with intelligent frequency
     private static logRateLimitStatus(rateLimitInfo: RateLimitInfo): void {
         const now = Date.now();
         const remainingPercentage = (rateLimitInfo.remaining / rateLimitInfo.limit) * 100;
 
-        // Log every 10 requests, or when approaching limits, or every 30 seconds
-        const shouldLog = this.requestCount % 10 === 0 ||
-            remainingPercentage < 25 ||
-            (now - this.lastRateLimitWarning) > 30000;
+        // Much more conservative logging: only when very low or every 2 minutes
+        const shouldLog = remainingPercentage < 15 ||
+            (now - this.lastRateLimitWarning) > 120000; // 2 minutes
 
         if (shouldLog) {
-            const timeUntilReset = rateLimitInfo.reset ? (rateLimitInfo.reset * 1000) - now : 0;
-            const minutesUntilReset = Math.max(0, Math.ceil(timeUntilReset / 60000));
-
-            const statusColor = remainingPercentage > 50 ? colors.green :
-                remainingPercentage > 25 ? colors.yellow : colors.red;
-
-            console.log(statusColor(`📊 API Rate Limit Status: ${rateLimitInfo.remaining}/${rateLimitInfo.limit} requests remaining`));
-
-            if (minutesUntilReset > 0) {
-                console.log(colors.gray(`   Resets in: ${minutesUntilReset} minute(s)`));
-            }
-
-            if (rateLimitInfo.burstLimit && rateLimitInfo.burstRemaining !== undefined) {
-                console.log(colors.blue(`   Burst: ${rateLimitInfo.burstRemaining}/${rateLimitInfo.burstLimit} remaining`));
-            }
+            const statusColor = remainingPercentage > 25 ? colors.yellow : colors.red;
+            console.log(statusColor(`📊 Rate Limit: ${rateLimitInfo.remaining}/${rateLimitInfo.limit} remaining (${remainingPercentage.toFixed(0)}%)`));
 
             log.debug(`Rate limit status: ${rateLimitInfo.remaining}/${rateLimitInfo.limit} (${remainingPercentage.toFixed(1)}%)`);
             this.lastRateLimitWarning = now;
         }
-    }
-
-    // Show countdown for long waits
+    }    // Show countdown for long waits
     private static async showCountdown(seconds: number): Promise<void> {
+        // Clear any existing line first
+        process.stdout.write('\r\x1b[K');
+
         for (let i = seconds; i > 0; i--) {
             const mins = Math.floor(i / 60);
             const secs = i % 60;
             const secsStr = secs < 10 ? `0${secs}` : `${secs}`;
             const timeStr = mins > 0 ? `${mins}:${secsStr}` : `${secs}s`;
 
-            process.stdout.write(`\r${colors.cyan('⏳')} Waiting ${timeStr} before retry...`);
+            // Clear line and write new countdown
+            process.stdout.write(`\r\x1b[K${colors.cyan('⏳')} Waiting ${timeStr}...`);
             await new Promise(resolve => setTimeout(resolve, 1000));
         }
-        console.log('\n' + colors.green('✅ Ready to resume requests'));
-    }
 
-    // Get current rate limit status for external monitoring
+        // Clear countdown line and show ready message
+        process.stdout.write('\r\x1b[K');
+        console.log(colors.green('✅ Resuming requests'));
+    }    // Get current rate limit status for external monitoring
     public static getCurrentRateLimit(): RateLimitInfo | null {
         return this.currentRateLimit;
     }
