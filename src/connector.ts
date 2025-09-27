@@ -46,6 +46,47 @@ export class FrontConnector {
         }
     }
 
+    // Memory-efficient paginated processing with callback for each batch
+    public static async processPaginatedAPIRequest<T>(
+        url: string,
+        processCallback: (items: T[], isLastBatch: boolean) => Promise<void>
+    ): Promise<void> {
+        try {
+            let currentUrl: string | null = url;
+            let totalProcessed = 0;
+
+            while (currentUrl) {
+                const response = await this.makeRateLimitedRequest('get', currentUrl);
+
+                // Validate response body
+                if (!response.body || !response.body._results) {
+                    log.warn(`Invalid response body from ${currentUrl}. Response: ${JSON.stringify(response.body)}`);
+                    throw new Error('Invalid response body: missing _results');
+                }
+
+                const items = response.body._results as T[];
+                totalProcessed += items.length;
+                const isLastBatch = !response.body._pagination?.next;
+
+                log.debug(`Processing batch of ${items.length} items. Total processed: ${totalProcessed}`);
+
+                // Process this batch
+                await processCallback(items, isLastBatch);
+
+                // Move to next page
+                currentUrl = response.body._pagination?.next || null;
+
+                // Allow some time for garbage collection between batches
+                await new Promise(resolve => setTimeout(resolve, 10));
+            }
+
+            log.debug(`Completed paginated processing. Total processed: ${totalProcessed}`);
+        } catch (error: any) {
+            log.error(`Failed to process paginated API request to ${url}: ${error.message}`);
+            throw error;
+        }
+    }
+
     private static async makeRateLimitedRequest(method: string, url: string, retryCount = 0): Promise<NeedleResponse> {
         const maxRetries = 3;
         const options = {

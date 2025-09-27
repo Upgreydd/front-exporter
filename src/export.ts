@@ -1,11 +1,11 @@
-import { Conversation, Inbox, Message, Comment, Attachment, ExportOptions } from './types'
-import { exportInbox, exportConversation, exportMessage, exportComment, exportAttachment, exportEMLMessage } from './helpers';
-import { FrontConnector } from './connector';
-const cliProgress = require('cli-progress');
 import fs from 'fs-extra';
+import { FrontConnector } from './connector';
+import { exportAttachment, exportComment, exportConversation, exportEMLMessage, exportInbox, exportMessage } from './helpers';
+import { Logger } from "./logging";
+import { Attachment, Comment, Conversation, ExportOptions, Inbox, Message } from './types';
+const cliProgress = require('cli-progress');
 
 var colors = require('@colors/colors');
-import { Logger } from "./logging";
 const log = Logger.getLogger("E");
 
 export class FrontExport {
@@ -20,43 +20,88 @@ export class FrontExport {
     }
 
     /**
-    * Exports all conversations for an inbox.
+    * Exports all conversations for an inbox using memory-efficient streaming.
     *
     * @param inbox - The inbox object to export conversations from.
     * @param options - An optional object containing export options.
     * @param shouldResume - A boolean indicating whether to resume the export process from a previous state.
-    * @returns A Promise that resolves to an array of Conversation objects.
+    * @returns A Promise that resolves to the total number of conversations processed.
     */
-    public static async exportInboxConversations(inbox: Inbox, options?: ExportOptions, shouldResume?: boolean): Promise<Conversation[]> {
-        let requiredConversations: string[] = [];
+    public static async exportInboxConversations(inbox: Inbox, options?: ExportOptions, shouldResume?: boolean): Promise<number> {
         const inboxPath = `./export/${inbox.name.replace(/ /g, '_')}`;
         const outputFilePath = `${inboxPath}/${inbox.id}.json`;
+        const progressFilePath = `${inboxPath}/progress.log`;
 
         // check if a directory for the inbox exists, if not, create it
-        if (exportInbox(inboxPath, inbox)) {
-            if (fs.existsSync(outputFilePath)) {
-                // check if JSON file already exists, read it into the inboxConversations array and run the export
-                console.log(colors.green(`Using existing JSON file for Export: ${outputFilePath}`));
-                log.debug(`Using existing JSON file for Export: ${outputFilePath}`);
-                requiredConversations = FrontExport.getCurrentProgress(inboxPath, outputFilePath, shouldResume);
-                const inboxConversations = JSON.parse(fs.readFileSync(outputFilePath).toString());
-                return this._exportConversationsWithOptions(inboxConversations, inboxPath, requiredConversations, shouldResume, options);
-            } else {
-                // if JSON file doesn't exist, call the API and save received data to disk in case there is a network error
-                const inboxConversationsUrl = `https://api2.frontapp.com/inboxes/${inbox.id}/conversations`;
-                log.warn(`Loading conversations from API, this may take a while...`);
-                const inboxConversations = await FrontConnector.makePaginatedAPIRequest<Conversation>(inboxConversationsUrl);
-                console.log(colors.green(`Saving list of conversations to: ${outputFilePath}`));
-                const jsonData = JSON.stringify(inboxConversations, null, 2);
-                await fs.promises.writeFile(outputFilePath, jsonData);
-                console.log(colors.green(`Conversations have been saved to: ${outputFilePath}`));
-                log.debug(`Conversations have been saved to: ${outputFilePath}`);
-                requiredConversations = FrontExport.getCurrentProgress(inboxPath, outputFilePath, shouldResume);
-                return this._exportConversationsWithOptions(inboxConversations, inboxPath, requiredConversations, shouldResume, options);
-            }
-        } else {
+        if (!exportInbox(inboxPath, inbox)) {
             throw new Error(`Unable to create directory for inbox: ${inbox.id}`);
         }
+
+        // Load existing progress if resuming
+        let processedConversations = new Set<string>();
+        if (shouldResume && fs.existsSync(progressFilePath)) {
+            const progressContent = fs.readFileSync(progressFilePath, 'utf8');
+            processedConversations = new Set(progressContent.split('\n').map((id: string) => id.trim()).filter((id: string) => id));
+            log.info(`Resuming export. Already processed: ${processedConversations.size} conversations`);
+        }
+
+        let totalConversations = 0;
+        let processedCount = 0;
+        let progressBar: any = null;
+
+        // If we have a cached conversation list, use it to get total count
+        if (fs.existsSync(outputFilePath)) {
+            console.log(colors.green(`Using existing conversation list: ${outputFilePath}`));
+            const cachedData = JSON.parse(fs.readFileSync(outputFilePath, 'utf8'));
+            totalConversations = cachedData.length;
+        }
+
+        const inboxConversationsUrl = `https://api2.frontapp.com/inboxes/${inbox.id}/conversations`;
+        log.warn(`Processing conversations from API...`);
+
+        await FrontConnector.processPaginatedAPIRequest<Conversation>(
+            inboxConversationsUrl,
+            async (conversations: Conversation[], isLastBatch: boolean) => {
+                // Initialize progress bar on first batch if we know total
+                if (!progressBar && totalConversations > 0) {
+                    progressBar = new cliProgress.SingleBar({
+                        format: 'Progress |' + colors.cyan('{bar}') + '| {percentage}% | {value}/{total}',
+                        barCompleteChar: '\u2588',
+                        barIncompleteChar: '\u2591',
+                        hideCursor: true
+                    });
+                    progressBar.start(totalConversations, processedConversations.size);
+                }
+
+                // Cache conversations to file if this is first run
+                if (!fs.existsSync(outputFilePath)) {
+                    await this._appendConversationsToCache(outputFilePath, conversations, isLastBatch);
+                }
+
+                // Process each conversation in this batch
+                for (const conversation of conversations) {
+                    if (!processedConversations.has(conversation.id)) {
+                        await this._processConversation(conversation, inboxPath, options);
+                        await FrontExport.updateProgress(inboxPath, conversation.id);
+                        processedConversations.add(conversation.id);
+                        processedCount++;
+
+                        if (progressBar) {
+                            progressBar.increment();
+                        }
+                    }
+                }
+
+                log.debug(`Processed batch of ${conversations.length} conversations. Total processed: ${processedCount}`);
+            }
+        );
+
+        if (progressBar) {
+            progressBar.stop();
+        }
+
+        log.info(`Export completed. Total conversations processed: ${processedCount}`);
+        return processedCount;
     }
 
     /**
@@ -76,7 +121,7 @@ export class FrontExport {
             const progressFile = fs.readFileSync(progressFilePath, "utf8")
                 .toString()
                 .split("\n")
-                .map((id) => id.trim());
+                .map((id: string) => id.trim());
             conversationsLeft = allConversationIDs.filter((id: string) => !progressFile.includes(id));
         } else {
             conversationsLeft = allConversationIDs;
@@ -84,67 +129,7 @@ export class FrontExport {
         return conversationsLeft;
     }
 
-    // ===================================================
-    /**
-    * Exports conversations from an inbox with options.
-    *
-    * @param conversations - The array of conversations to be exported.
-    * @param exportPath - The path where the conversations will be exported.
-    * @param conversationsRequired - An array of conversation IDs to be exported.
-    * @param options - An object containing options for the export process.
-    * @returns A Promise that resolves to an array of Conversation objects.
-    */
-    private static async _exportConversationsWithOptions(conversations: Conversation[], exportPath: string, conversationsRequired: string[], shouldResume?: boolean, options?: ExportOptions): Promise<Conversation[]> {
-        log.info(`Total to Export: ${conversationsRequired.length}`);
-        const progressBar1 = new cliProgress.SingleBar({
-            format: 'Progress |' + colors.cyan('{bar}') + '| {percentage}% | {value}/{total}',
-            barCompleteChar: '\u2588',
-            barIncompleteChar: '\u2591',
-            hideCursor: true
-        });
-        progressBar1.start(conversationsRequired.length, 0);
 
-        for (const conversation of conversations) {
-            log.debug(`Using: ${conversation.id}`);
-
-            // Check if the current conversation exists in the requiredConversations array
-            // Export only the conversations that match the requiredConversations array
-            if (conversationsRequired.includes(conversation.id)) {
-                log.debug(`${conversation.id} is required - Exporting...`);
-
-                // Everything past this point nests in conversation's path
-                const conversationPath = `${exportPath}/${conversation.id}`;
-                exportConversation(conversationPath, conversation);
-
-                if (options?.includeMessages) {
-                    if (options?.exportAsEML) {
-                        const messages = await this._exportMessagesAsEML(conversationPath, conversation);
-                        if (options?.includeAttachments) {
-                            for (const message of messages) {
-                                await this._exportMessageAttachments(conversationPath, message);
-                            }
-                        }
-                    } else {
-                        const messages = await this._exportConversationMessages(conversationPath, conversation);
-                        if (options?.includeAttachments) {
-                            for (const message of messages) {
-                                await this._exportMessageAttachments(conversationPath, message);
-                            }
-                        }
-                    }
-                }
-                if (options?.includeComments) {
-                    await this._exportConversationComments(conversationPath, conversation);
-                }
-                progressBar1.increment();
-                FrontExport.updateProgress(exportPath, conversation.id);
-            } else {
-                log.debug(`${conversation.id} not required - SKIPPING`);
-            }
-        }
-        progressBar1.stop();
-        return conversations;
-    }
 
     // ==============================================
     /**
@@ -235,6 +220,71 @@ export class FrontExport {
     private static async _listConversationComments(conversation: Conversation): Promise<Comment[]> {
         const url = `https://api2.frontapp.com/conversations/${conversation.id}/comments`;
         return FrontConnector.makePaginatedAPIRequest<Comment>(url);
+    }
+
+    /**
+    * Appends conversations to cache file in streaming fashion to avoid memory issues.
+    */
+    private static async _appendConversationsToCache(
+        outputFilePath: string,
+        conversations: Conversation[],
+        isLastBatch: boolean
+    ): Promise<void> {
+        const isFirstWrite = !fs.existsSync(outputFilePath);
+
+        if (isFirstWrite) {
+            // Write opening bracket
+            await fs.writeFile(outputFilePath, '[\n');
+        }
+
+        for (let i = 0; i < conversations.length; i++) {
+            const conversation = conversations[i];
+            const jsonLine = JSON.stringify(conversation, null, 2);
+            const separator = (!isFirstWrite || i > 0) ? ',\n' : '';
+            await fs.appendFile(outputFilePath, separator + jsonLine);
+        }
+
+        if (isLastBatch) {
+            // Write closing bracket
+            await fs.appendFile(outputFilePath, '\n]');
+            console.log(colors.green(`Conversations have been saved to: ${outputFilePath}`));
+        }
+    }
+
+    /**
+    * Process a single conversation with all its messages, comments, and attachments.
+    */
+    private static async _processConversation(
+        conversation: Conversation,
+        inboxPath: string,
+        options?: ExportOptions
+    ): Promise<void> {
+        log.debug(`Processing conversation: ${conversation.id}`);
+
+        const conversationPath = `${inboxPath}/${conversation.id}`;
+        exportConversation(conversationPath, conversation);
+
+        if (options?.includeMessages) {
+            if (options?.exportAsEML) {
+                const messages = await this._exportMessagesAsEML(conversationPath, conversation);
+                if (options?.includeAttachments) {
+                    for (const message of messages) {
+                        await this._exportMessageAttachments(conversationPath, message);
+                    }
+                }
+            } else {
+                const messages = await this._exportConversationMessages(conversationPath, conversation);
+                if (options?.includeAttachments) {
+                    for (const message of messages) {
+                        await this._exportMessageAttachments(conversationPath, message);
+                    }
+                }
+            }
+        }
+
+        if (options?.includeComments) {
+            await this._exportConversationComments(conversationPath, conversation);
+        }
     }
 
     /**
