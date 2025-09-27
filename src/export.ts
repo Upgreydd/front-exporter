@@ -48,6 +48,8 @@ export class FrontExport {
         let totalConversations = 0;
         let processedCount = 0;
         let progressBar: any = null;
+        let totalBatches = 0;
+        let currentBatch = 0;
 
         // If we have a cached conversation list, use it to get total count
         if (fs.existsSync(outputFilePath)) {
@@ -57,48 +59,106 @@ export class FrontExport {
         }
 
         const inboxConversationsUrl = `https://api2.frontapp.com/inboxes/${inbox.id}/conversations`;
-        log.warn(`Processing conversations from API...`);
+        console.log(colors.yellow(`📥 Processing conversations from inbox: ${inbox.name}`));
 
-        await FrontConnector.processPaginatedAPIRequest<Conversation>(
+        // Show initial status
+        if (processedConversations.size > 0) {
+            console.log(colors.blue(`🔄 Resuming from ${processedConversations.size} already processed conversations`));
+        }
+
+        // Show rate limit information at start
+        const initialRateLimit = FrontConnector.getCurrentRateLimit();
+        if (initialRateLimit) {
+            console.log(colors.cyan(`📊 API Rate Limit: ${initialRateLimit.remaining}/${initialRateLimit.limit} requests available`));
+        } await FrontConnector.processPaginatedAPIRequest<Conversation>(
             inboxConversationsUrl,
             async (conversations: Conversation[], isLastBatch: boolean) => {
-                // Initialize progress bar on first batch if we know total
-                if (!progressBar && totalConversations > 0) {
-                    progressBar = new cliProgress.SingleBar({
-                        format: 'Progress |' + colors.cyan('{bar}') + '| {percentage}% | {value}/{total}',
-                        barCompleteChar: '\u2588',
-                        barIncompleteChar: '\u2591',
-                        hideCursor: true
-                    });
-                    progressBar.start(totalConversations, processedConversations.size);
+                currentBatch++;
+
+                // Initialize progress bar on first batch
+                if (!progressBar) {
+                    if (totalConversations > 0) {
+                        // We know the total, show percentage progress
+                        progressBar = new cliProgress.SingleBar({
+                            format: 'Progress |' + colors.cyan('{bar}') + '| {percentage}% | {value}/{total} conversations',
+                            barCompleteChar: '\u2588',
+                            barIncompleteChar: '\u2591',
+                            hideCursor: true
+                        });
+                        progressBar.start(totalConversations, processedConversations.size);
+                    } else {
+                        // We don't know the total, show simple counter
+                        console.log(colors.blue(`📊 Processing conversations in batches...`));
+                    }
                 }
 
                 // Cache conversations to file if this is first run
                 if (!fs.existsSync(outputFilePath)) {
                     await this._appendConversationsToCache(outputFilePath, conversations, isLastBatch);
+
+                    // If this was the first run and we just finished caching, update total
+                    if (isLastBatch && !totalConversations) {
+                        const cachedData = JSON.parse(fs.readFileSync(outputFilePath, 'utf8'));
+                        totalConversations = cachedData.length;
+                        console.log(colors.green(`📊 Total conversations found: ${totalConversations}`));
+                    }
                 }
 
                 // Process each conversation in this batch
+                let batchProcessedCount = 0;
+
+                console.log(colors.gray(`🔄 Processing batch ${currentBatch} (${conversations.length} conversations)...`));
+
+                // Show rate limit warning if getting low
+                const currentRateLimit = FrontConnector.getCurrentRateLimit();
+                if (currentRateLimit && currentRateLimit.remaining < 10) {
+                    console.log(colors.yellow(`⚠️  Low API requests: ${currentRateLimit.remaining}/${currentRateLimit.limit} remaining`));
+                }
+
                 for (const conversation of conversations) {
                     if (!processedConversations.has(conversation.id)) {
                         await this._processConversation(conversation, inboxPath, options);
                         await FrontExport.updateProgress(inboxPath, conversation.id);
                         processedConversations.add(conversation.id);
                         processedCount++;
+                        batchProcessedCount++;
 
                         if (progressBar) {
                             progressBar.increment();
+                        } else {
+                            // Show simple progress without bar
+                            if (batchProcessedCount % 10 === 0 || batchProcessedCount === conversations.length) {
+                                const rateLimitStatus = FrontConnector.getCurrentRateLimit();
+                                const rateLimitText = rateLimitStatus ? ` [${rateLimitStatus.remaining}/${rateLimitStatus.limit} API calls left]` : '';
+                                console.log(`${colors.cyan('▶')} Processed: ${processedCount} conversations${rateLimitText}`);
+                            }
                         }
                     }
                 }
 
-                log.debug(`Processed batch of ${conversations.length} conversations. Total processed: ${processedCount}`);
+                if (!progressBar) {
+                    console.log(colors.green(`\n✅ Batch ${currentBatch} completed: ${batchProcessedCount} new conversations processed`));
+                }
+
+                log.debug(`Processed batch ${currentBatch} of ${conversations.length} conversations. Total processed: ${processedCount}`);
             }
         );
 
         if (progressBar) {
             progressBar.stop();
+        } else {
+            console.log(); // New line after the progress counter
         }
+
+        console.log(colors.green.bold(`🎉 Export completed for ${inbox.name}!`));
+        console.log(colors.cyan(`📈 Total conversations processed: ${processedCount}`));
+        if (totalConversations > 0) {
+            console.log(colors.cyan(`📊 Total conversations in inbox: ${totalConversations}`));
+        }
+
+        // Show final rate limit status
+        const rateLimitSummary = FrontConnector.getRateLimitSummary();
+        console.log(colors.gray(`📊 API Usage: ${rateLimitSummary}`));
 
         log.info(`Export completed. Total conversations processed: ${processedCount}`);
         return processedCount;

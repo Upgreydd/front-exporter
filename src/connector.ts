@@ -4,6 +4,17 @@ import { Logger } from "./logging";
 var colors = require('@colors/colors');
 export const log = Logger.getLogger("C");
 
+// Interface for tracking rate limit information from API headers
+interface RateLimitInfo {
+    limit: number;              // x-ratelimit-limit: Maximum requests per minute
+    remaining: number;          // x-ratelimit-remaining: Requests left in current window
+    reset: number;              // x-ratelimit-reset: UNIX timestamp when limit resets
+    burstLimit?: number;        // x-ratelimit-burst-limit: Additional burst allowance
+    burstRemaining?: number;    // x-ratelimit-burst-remaining: Burst requests remaining
+    retryAfter?: number;        // retry-after: Seconds to wait before retry (when rate limited)
+    frontTier?: number;         // x-front-tier: Tier-specific rate limiting
+}
+
 import 'dotenv/config';
 import * as env from 'env-var';
 export const API_KEY = env.get('API_KEY').required().asString();
@@ -13,6 +24,11 @@ export class FrontConnector {
         Authorization: `Bearer ${API_KEY}`,
         Accept: `message/rfc822` // This is the MIME type for .eml files
     };
+
+    // Track current rate limit status
+    private static currentRateLimit: RateLimitInfo | null = null;
+    private static lastRateLimitWarning = 0;
+    private static requestCount = 0;
 
     // Aggregates API resources from a resource url and any subsequent _pagination.next urls
     public static async makePaginatedAPIRequest<T>(url: string, resources: T[] = []): Promise<T[]> {
@@ -136,36 +152,159 @@ export class FrontConnector {
             (error.statusCode && error.statusCode >= 500);
     }
 
-    // Please see https://dev.frontapp.com/docs/rate-limiting for additional rate-limiting details
-    private static async handleRateLimiting(res: NeedleResponse): Promise<any> {
-        const requestsRemaining = this.parseHeaderInt(res, 'x-ratelimit-remaining');
-        const retryAfterMillis = 1000 * this.parseHeaderInt(res, 'retry-after');
+    // Comprehensive rate limit monitoring and handling
+    // See: https://dev.frontapp.com/docs/rate-limiting#monitor-your-rate-limit-with-api-headers
+    private static async handleRateLimiting(res: NeedleResponse): Promise<void> {
+        // Extract all rate limit headers
+        const rateLimitInfo: RateLimitInfo = {
+            limit: this.parseHeaderInt(res, 'x-ratelimit-limit') || 50, // Default to 50 rpm
+            remaining: this.parseHeaderInt(res, 'x-ratelimit-remaining') || 0,
+            reset: this.parseHeaderInt(res, 'x-ratelimit-reset') || 0,
+            burstLimit: this.parseHeaderInt(res, 'x-ratelimit-burst-limit'),
+            burstRemaining: this.parseHeaderInt(res, 'x-ratelimit-burst-remaining'),
+            retryAfter: this.parseHeaderInt(res, 'retry-after'),
+            frontTier: this.parseHeaderInt(res, 'x-front-tier')
+        };
 
-        // If there's no 'retry-after', return early
-        if (!retryAfterMillis) {
+        // Update our tracking
+        this.currentRateLimit = rateLimitInfo;
+        this.requestCount++;
+
+        // Log detailed rate limit status periodically or when approaching limits
+        this.logRateLimitStatus(rateLimitInfo);
+
+        // Handle 429 Too Many Requests
+        if (res.statusCode === 429) {
+            await this.handleRateLimitExceeded(rateLimitInfo);
             return;
         }
 
-        // If there are requests remaining, but we saw a 429 status, then we hit a burst limit:
-        // https://dev.frontapp.com/docs/rate-limiting#additional-burst-rate-limiting
-        if (requestsRemaining > 0) {
-            const burstLimitTier = this.parseHeaderInt(res, 'x-front-tier');
-            console.log(colors.red(`Tier ${burstLimitTier} resource burst limit reached`));
-        }
-        // Otherwise, if remaining is 0, we simply ran out of global requests.
-        else {
-            const globalLimit = this.parseHeaderInt(res, 'x-ratelimit-limit');
-            console.log(colors.red(`Global rate limit of ${globalLimit} reached`));
-        }
-        // Either way, wait for retry-after
-        return new Promise(resolve => {
-            setTimeout(resolve, retryAfterMillis);
-        });
+        // Proactive rate limit management - slow down when approaching limits
+        await this.proactiveRateLimitManagement(rateLimitInfo);
     }
 
-    private static parseHeaderInt(res: NeedleResponse, key: string) {
+    // Handle when rate limit is exceeded (429 response)
+    private static async handleRateLimitExceeded(rateLimitInfo: RateLimitInfo): Promise<void> {
+        const waitTimeSeconds = rateLimitInfo.retryAfter || 60;
+        const waitTimeMs = waitTimeSeconds * 1000;
+
+        if (rateLimitInfo.remaining && rateLimitInfo.remaining > 0) {
+            // Burst limit exceeded
+            console.log(colors.red.bold('⚠️  BURST RATE LIMIT EXCEEDED'));
+            console.log(colors.yellow(`   Tier: ${rateLimitInfo.frontTier || 'Unknown'}`));
+            console.log(colors.yellow(`   Regular requests remaining: ${rateLimitInfo.remaining}/${rateLimitInfo.limit}`));
+            if (rateLimitInfo.burstRemaining !== undefined) {
+                console.log(colors.yellow(`   Burst requests remaining: ${rateLimitInfo.burstRemaining}/${rateLimitInfo.burstLimit || 'Unknown'}`));
+            }
+        } else {
+            // Global rate limit exceeded
+            console.log(colors.red.bold('🚫 GLOBAL RATE LIMIT EXCEEDED'));
+            console.log(colors.yellow(`   Rate limit: ${rateLimitInfo.limit} requests/minute`));
+            console.log(colors.yellow(`   Requests remaining: ${rateLimitInfo.remaining}`));
+        }
+
+        console.log(colors.cyan(`⏳ Waiting ${waitTimeSeconds} seconds before retry...`));
+        log.warn(`Rate limit exceeded. Waiting ${waitTimeSeconds} seconds.`);
+
+        // Show countdown for long waits
+        if (waitTimeSeconds > 10) {
+            await this.showCountdown(waitTimeSeconds);
+        } else {
+            await new Promise(resolve => setTimeout(resolve, waitTimeMs));
+        }
+    }
+
+    // Proactive management to avoid hitting rate limits
+    private static async proactiveRateLimitManagement(rateLimitInfo: RateLimitInfo): Promise<void> {
+        const remainingPercentage = (rateLimitInfo.remaining / rateLimitInfo.limit) * 100;
+        const timeUntilReset = rateLimitInfo.reset ? (rateLimitInfo.reset * 1000) - Date.now() : 60000;
+        const secondsUntilReset = Math.max(0, Math.floor(timeUntilReset / 1000));
+
+        // If we're getting low on requests, slow down
+        if (remainingPercentage < 20 && rateLimitInfo.remaining > 0) {
+            const delayMs = Math.max(100, (60 - secondsUntilReset) * 10); // Adaptive delay
+
+            log.debug(`Proactive rate limiting: ${rateLimitInfo.remaining} requests remaining (${remainingPercentage.toFixed(1)}%). Delaying ${delayMs}ms`);
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+
+        // If we're very low on requests, add more significant delay
+        if (remainingPercentage < 10 && rateLimitInfo.remaining > 0) {
+            const delayMs = Math.max(500, (60 - secondsUntilReset) * 50);
+
+            console.log(colors.yellow(`⚠️  Low on API requests: ${rateLimitInfo.remaining}/${rateLimitInfo.limit} remaining. Slowing down...`));
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+    }
+
+    // Log rate limit status with intelligent frequency
+    private static logRateLimitStatus(rateLimitInfo: RateLimitInfo): void {
+        const now = Date.now();
+        const remainingPercentage = (rateLimitInfo.remaining / rateLimitInfo.limit) * 100;
+
+        // Log every 10 requests, or when approaching limits, or every 30 seconds
+        const shouldLog = this.requestCount % 10 === 0 ||
+            remainingPercentage < 25 ||
+            (now - this.lastRateLimitWarning) > 30000;
+
+        if (shouldLog) {
+            const timeUntilReset = rateLimitInfo.reset ? (rateLimitInfo.reset * 1000) - now : 0;
+            const minutesUntilReset = Math.max(0, Math.ceil(timeUntilReset / 60000));
+
+            const statusColor = remainingPercentage > 50 ? colors.green :
+                remainingPercentage > 25 ? colors.yellow : colors.red;
+
+            console.log(statusColor(`📊 API Rate Limit Status: ${rateLimitInfo.remaining}/${rateLimitInfo.limit} requests remaining`));
+
+            if (minutesUntilReset > 0) {
+                console.log(colors.gray(`   Resets in: ${minutesUntilReset} minute(s)`));
+            }
+
+            if (rateLimitInfo.burstLimit && rateLimitInfo.burstRemaining !== undefined) {
+                console.log(colors.blue(`   Burst: ${rateLimitInfo.burstRemaining}/${rateLimitInfo.burstLimit} remaining`));
+            }
+
+            log.debug(`Rate limit status: ${rateLimitInfo.remaining}/${rateLimitInfo.limit} (${remainingPercentage.toFixed(1)}%)`);
+            this.lastRateLimitWarning = now;
+        }
+    }
+
+    // Show countdown for long waits
+    private static async showCountdown(seconds: number): Promise<void> {
+        for (let i = seconds; i > 0; i--) {
+            const mins = Math.floor(i / 60);
+            const secs = i % 60;
+            const secsStr = secs < 10 ? `0${secs}` : `${secs}`;
+            const timeStr = mins > 0 ? `${mins}:${secsStr}` : `${secs}s`;
+
+            process.stdout.write(`\r${colors.cyan('⏳')} Waiting ${timeStr} before retry...`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+        console.log('\n' + colors.green('✅ Ready to resume requests'));
+    }
+
+    // Get current rate limit status for external monitoring
+    public static getCurrentRateLimit(): RateLimitInfo | null {
+        return this.currentRateLimit;
+    }
+
+    // Get a summary of rate limit usage
+    public static getRateLimitSummary(): string {
+        if (!this.currentRateLimit) {
+            return 'No rate limit information available';
+        }
+
+        const rl = this.currentRateLimit;
+        const percentage = ((rl.limit - rl.remaining) / rl.limit * 100).toFixed(1);
+        return `Used ${rl.limit - rl.remaining}/${rl.limit} requests (${percentage}%). ${rl.remaining} remaining.`;
+    }
+
+    private static parseHeaderInt(res: NeedleResponse, key: string): number | undefined {
         const value = res.headers[key] as string;
-        return parseInt(value);
+        if (!value) return undefined;
+
+        const parsed = parseInt(value, 10);
+        return isNaN(parsed) ? undefined : parsed;
     }
 
     public static async getAttachmentFromURL(url: string): Promise<Buffer> {

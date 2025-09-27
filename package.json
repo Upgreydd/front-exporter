@@ -6,7 +6,9 @@
   "scripts": {
     "start": "ts-node ./src/index.ts",
     "start:optimized": "node --max-old-space-size=4096 --expose-gc --optimize-for-size -r ts-node/register ./src/index.ts",
-    "start:safe": "node --max-old-space-size=8192 --expose-gc -r ts-node/register ./src/index.ts"
+    "start:safe": "node --max-old-space-size=8192 --expose-gc -r ts-node/register ./src/index.ts",
+    "rate-limit": "yarn start:optimized rate-limit",
+    "list": "yarn start:optimized list-inboxes"
   },
   "dependencies": {
     "@colors/colors": "^1.6.0",
