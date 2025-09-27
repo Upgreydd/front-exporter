@@ -101,16 +101,26 @@ export async function exportFromInbox(inboxID: string, shouldResume: any) {
         // Reset progress tracking for this export session
         FrontConnector.resetProgressTracking();
 
-        const inboxes = await FrontExport.listInboxes();
-        const inboxToExport = inboxes.find(inbox => inbox.id === inboxID);
+        // Create inbox object directly instead of fetching all inboxes
+        // This saves an unnecessary API call to list all inboxes
+        const inboxToExport = {
+            id: inboxID,
+            name: `Inbox ${inboxID}`,
+            is_private: false,
+            _links: { self: `https://api2.frontapp.com/inboxes/${inboxID}` }
+        };
 
-        if (inboxToExport) {
-            console.log(colors.blue(`\nStarting export for inbox: ${inboxToExport.name} (${inboxToExport.id})`));
+        console.log(colors.blue(`\nStarting export for inbox: ${inboxToExport.id}`));
+
+        try {
             const totalProcessed = await FrontExport.exportInboxConversations(inboxToExport, options, shouldResume);
             console.log(colors.green(`✅ Export completed! Total processed: ${totalProcessed}`));
             log.info(`Total Exported: ${totalProcessed}`);
-        } else {
-            throw new Error(`Inbox with ID ${inboxID} not found.`);
+        } catch (error: any) {
+            if (error.message.includes('404') || error.message.includes('not found')) {
+                throw new Error(`Inbox with ID ${inboxID} not found or access denied.`);
+            }
+            throw error;
         }
     } catch (error: any) {
         log.error("Error exporting conversations:", error.message);
